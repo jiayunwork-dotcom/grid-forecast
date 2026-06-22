@@ -46,7 +46,7 @@ class AnomalyDetector:
         series: pd.Series,
         times: pd.Series,
         idx: int
-    ) -> Tuple[Optional[float], Optional[float]]:
+    ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
         current_time = times.iloc[idx]
         target_time = current_time.time()
 
@@ -61,9 +61,10 @@ class AnomalyDetector:
 
         history_values = series[mask].values
         history_values = history_values[~np.isnan(history_values)]
+        baseline_sample_count = len(history_values)
 
-        if len(history_values) < 3:
-            return None, None
+        if baseline_sample_count < 3:
+            return None, None, None
 
         for _ in range(self.max_iterations):
             median_val = np.median(history_values)
@@ -84,7 +85,7 @@ class AnomalyDetector:
         mad = np.median(np.abs(history_values - median_val))
         std_est = 1.4826 * mad if mad > 0 else (np.std(history_values) if len(history_values) > 0 else 0)
 
-        return float(median_val), float(std_est)
+        return float(median_val), float(std_est), baseline_sample_count
 
     def detect_anomalies(self, df: pd.DataFrame) -> pd.DataFrame:
         df = self._validate_data(df)
@@ -92,6 +93,7 @@ class AnomalyDetector:
         result_df = df.copy()
         result_df['baseline_median'] = np.nan
         result_df['baseline_std'] = np.nan
+        result_df['baseline_sample_count'] = np.nan
         result_df['is_anomaly'] = False
         result_df['deviation_ratio'] = np.nan
         result_df['deviation_direction'] = 0
@@ -100,7 +102,7 @@ class AnomalyDetector:
         times = df[self.datetime_col]
 
         for i in range(len(df)):
-            median_val, std_val = self._compute_baseline_for_point(series, times, i)
+            median_val, std_val, sample_count = self._compute_baseline_for_point(series, times, i)
             if median_val is None or std_val is None or std_val == 0:
                 continue
 
@@ -110,6 +112,7 @@ class AnomalyDetector:
 
             result_df.at[i, 'baseline_median'] = median_val
             result_df.at[i, 'baseline_std'] = std_val
+            result_df.at[i, 'baseline_sample_count'] = sample_count
             result_df.at[i, 'deviation_ratio'] = deviation_ratio
 
             if abs(deviation_ratio) > self.mad_threshold:
@@ -117,6 +120,19 @@ class AnomalyDetector:
                 result_df.at[i, 'deviation_direction'] = 1 if deviation_ratio > 0 else -1
 
         return result_df
+
+    def _calculate_confidence_score(
+        self,
+        peak_deviation_ratio: float,
+        duration_minutes: float,
+        avg_baseline_samples: float,
+        mad_threshold: float
+    ) -> int:
+        deviation_factor = min(abs(peak_deviation_ratio) / mad_threshold * 40, 40)
+        duration_factor = min(duration_minutes / 120 * 30, 30)
+        sample_factor = min(avg_baseline_samples / 14 * 30, 30)
+        total_score = deviation_factor + duration_factor + sample_factor
+        return int(round(total_score))
 
     def aggregate_anomaly_events(self, anomaly_df: pd.DataFrame) -> pd.DataFrame:
         df = anomaly_df.copy()
@@ -126,7 +142,8 @@ class AnomalyDetector:
         if not anomaly_indices:
             return pd.DataFrame(columns=[
                 'event_id', 'start_time', 'end_time', 'duration_minutes',
-                'peak_deviation_ratio', 'deviation_direction', 'anomaly_count'
+                'peak_deviation_ratio', 'deviation_direction', 'anomaly_count',
+                'avg_baseline_samples', 'confidence_score'
             ])
 
         events = []
@@ -161,6 +178,14 @@ class AnomalyDetector:
             peak_ratio = event_data.loc[peak_idx, 'deviation_ratio']
             direction = 1 if peak_ratio > 0 else -1
 
+            avg_baseline_samples = event_data['baseline_sample_count'].mean()
+            if pd.isna(avg_baseline_samples):
+                avg_baseline_samples = 3.0
+
+            confidence_score = self._calculate_confidence_score(
+                peak_ratio, duration, avg_baseline_samples, self.mad_threshold
+            )
+
             event_list.append({
                 'event_id': event_id,
                 'start_time': start_time,
@@ -168,7 +193,9 @@ class AnomalyDetector:
                 'duration_minutes': int(duration),
                 'peak_deviation_ratio': float(peak_ratio),
                 'deviation_direction': '正异常(负荷突增)' if direction > 0 else '负异常(负荷骤降)',
-                'anomaly_count': len(event_indices)
+                'anomaly_count': len(event_indices),
+                'avg_baseline_samples': float(avg_baseline_samples),
+                'confidence_score': confidence_score
             })
 
         return pd.DataFrame(event_list)
@@ -221,7 +248,10 @@ class AnomalyDetector:
     def aggregate_weather_events(self, weather_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         result = {}
 
-        for event_type, col in [('temperature', 'temp_mutation'), ('solar', 'solar_mutation')]:
+        for event_type, col, diff_col in [
+            ('temperature', 'temp_mutation', 'temp_diff'),
+            ('solar', 'solar_mutation', 'solar_diff')
+        ]:
             if col not in weather_df.columns:
                 result[event_type] = pd.DataFrame()
                 continue
@@ -231,7 +261,8 @@ class AnomalyDetector:
 
             if not mutation_indices:
                 result[event_type] = pd.DataFrame(columns=[
-                    'event_id', 'start_time', 'end_time', 'duration_minutes'
+                    'event_id', 'start_time', 'end_time', 'duration_minutes',
+                    'mutation_magnitude', 'mutation_points'
                 ])
                 continue
 
@@ -255,11 +286,19 @@ class AnomalyDetector:
                 start_t = e_data[self.datetime_col].iloc[0]
                 end_t = e_data[self.datetime_col].iloc[-1]
                 dur = (end_t - start_t).total_seconds() / 60 + 15
+
+                if diff_col in e_data.columns:
+                    max_mutation = e_data[diff_col].abs().max()
+                else:
+                    max_mutation = np.nan
+
                 event_list.append({
                     'event_id': eid,
                     'start_time': start_t,
                     'end_time': end_t,
-                    'duration_minutes': int(dur)
+                    'duration_minutes': int(dur),
+                    'mutation_magnitude': float(max_mutation) if not pd.isna(max_mutation) else 0.0,
+                    'mutation_points': len(e_indices)
                 })
 
             result[event_type] = pd.DataFrame(event_list)
@@ -280,6 +319,7 @@ class AnomalyDetector:
         result['has_calendar'] = False
         result['weather_event_types'] = ''
         result['calendar_info'] = ''
+        result['related_weather_events'] = ''
 
         all_weather = []
         for wtype, wdf in weather_events.items():
@@ -312,6 +352,19 @@ class AnomalyDetector:
                     for t in types:
                         type_names.append('气温突变' if t == 'temperature' else '辐照突变')
                     result.at[idx, 'weather_event_types'] = '、'.join(type_names)
+
+                    weather_details = []
+                    for _, wrow in matched.iterrows():
+                        wtype_cn = '气温突变' if wrow['event_type'] == 'temperature' else '辐照突变'
+                        mag = wrow.get('mutation_magnitude', 0)
+                        if wrow['event_type'] == 'temperature':
+                            mag_str = f"{mag:.1f}°C"
+                        else:
+                            mag_str = f"{mag:.0f} W/m²"
+                        weather_details.append(
+                            f"{wtype_cn}: {wrow['start_time'].strftime('%H:%M')}-{wrow['end_time'].strftime('%H:%M')}, 突变幅度{mag_str}"
+                        )
+                    result.at[idx, 'related_weather_events'] = '|'.join(weather_details)
 
             if calendar_df is not None and len(calendar_df) > 0:
                 cal = calendar_df.copy()

@@ -2130,6 +2130,22 @@ def page_anomaly_detection():
         corr_window = st.slider("关联搜索窗口(小时)", 1, 6, 2, 1)
 
     st.markdown("---")
+    st.subheader("筛选与排序")
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        confidence_range = st.slider(
+            "置信度范围筛选",
+            min_value=0,
+            max_value=100,
+            value=(0, 100),
+            step=5,
+            help="拖动滑块筛选指定置信度范围内的异常事件"
+        )
+    with col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.info(f"当前筛选: {confidence_range[0]} - {confidence_range[1]} 分")
+
+    st.markdown("---")
 
     if st.button("🔍 执行异常检测与关联分析", type="primary") or st.session_state.anomaly_detection_result is not None:
         need_recompute = st.button("🔄 重新执行分析", key='recompute_anomaly')
@@ -2164,32 +2180,66 @@ def page_anomaly_detection():
         correlation_stats = result['correlation_stats']
         monthly_stats = result['monthly_stats']
         anomaly_points_df = result['anomaly_points']
+        weather_mutations_df = result['weather_mutations']
+
+        if 'confidence_score' in anomaly_events.columns:
+            filtered_events = anomaly_events[
+                (anomaly_events['confidence_score'] >= confidence_range[0]) &
+                (anomaly_events['confidence_score'] <= confidence_range[1])
+            ].copy()
+        else:
+            filtered_events = anomaly_events.copy()
+
+        if len(filtered_events) > 0:
+            filtered_correlation_stats = pd.DataFrame({
+                '关联类型': filtered_events['correlation_type'].value_counts().index,
+                '事件数量': filtered_events['correlation_type'].value_counts().values,
+                '占比': filtered_events['correlation_type'].value_counts().values / len(filtered_events)
+            })
+            events_cp = filtered_events.copy()
+            events_cp['month'] = pd.to_datetime(events_cp['start_time']).dt.to_period('M')
+            filtered_monthly_stats = events_cp.groupby('month').size().reset_index(name='异常事件数')
+            filtered_monthly_stats['month'] = filtered_monthly_stats['month'].astype(str)
+        else:
+            filtered_correlation_stats = correlation_stats
+            filtered_monthly_stats = monthly_stats
 
         st.subheader("1. 异常事件概览")
 
         total_events = len(anomaly_events)
+        filtered_total = len(filtered_events)
         if total_events > 0:
-            pos_count = len(anomaly_events[anomaly_events['deviation_direction'].str.contains('正')])
-            neg_count = total_events - pos_count
-            avg_duration = anomaly_events['duration_minutes'].mean()
-            avg_deviation = anomaly_events['peak_deviation_ratio'].abs().mean()
+            pos_count = len(filtered_events[filtered_events['deviation_direction'].str.contains('正')])
+            neg_count = filtered_total - pos_count
+            avg_duration = filtered_events['duration_minutes'].mean() if filtered_total > 0 else 0
+            avg_deviation = filtered_events['peak_deviation_ratio'].abs().mean() if filtered_total > 0 else 0
 
-            col1, col2, col3, col4 = st.columns(4)
+            if 'confidence_score' in anomaly_events.columns:
+                avg_confidence = anomaly_events['confidence_score'].mean()
+                high_conf_count = len(anomaly_events[anomaly_events['confidence_score'] >= 70])
+            else:
+                avg_confidence = 0
+                high_conf_count = 0
+
+            col1, col2, col3, col4, col5 = st.columns(5)
             with col1:
-                st.metric("异常事件总数", total_events)
+                st.metric("异常事件总数", f"{total_events}", f"筛选后: {filtered_total}")
             with col2:
                 st.metric("正异常(突增)", pos_count)
             with col3:
                 st.metric("负异常(骤降)", neg_count)
             with col4:
                 st.metric("平均持续时长", f"{avg_duration:.0f} 分钟")
+            with col5:
+                if 'confidence_score' in anomaly_events.columns:
+                    st.metric("平均置信度", f"{avg_confidence:.0f} 分", f"高置信度: {high_conf_count} 件")
         else:
             st.info("未检测到异常事件")
 
         st.markdown("---")
         st.subheader("2. 异常事件时间轴")
 
-        if total_events > 0:
+        if filtered_total > 0:
             color_map = {
                 '气象关联': '#dc3545',
                 '日历关联': '#ED8936',
@@ -2197,34 +2247,52 @@ def page_anomaly_detection():
                 '未知原因': '#718096'
             }
 
-            scatter_df = anomaly_events.copy()
+            scatter_df = filtered_events.copy()
             scatter_df['color'] = scatter_df['correlation_type'].map(color_map)
             scatter_df['abs_deviation'] = scatter_df['peak_deviation_ratio'].abs()
+
+            has_confidence = 'confidence_score' in scatter_df.columns
 
             fig = go.Figure()
 
             for corr_type, color in color_map.items():
                 sub = scatter_df[scatter_df['correlation_type'] == corr_type]
                 if len(sub) > 0:
+                    if has_confidence:
+                        marker_size = 8 + (sub['confidence_score'] / 100) * 12
+                        custom_data = sub[['duration_minutes', 'confidence_score']].values
+                        hover_template = (
+                            '开始时间: %{x}<br>'
+                            '偏离倍数: %{y:.2f}<br>'
+                            '持续时长: %{customdata[0]}分钟<br>'
+                            '置信度: %{customdata[1]}分<br>'
+                            '关联类型: ' + corr_type + '<br>'
+                            '<extra></extra>'
+                        )
+                    else:
+                        marker_size = 10
+                        custom_data = sub[['duration_minutes']].values
+                        hover_template = (
+                            '开始时间: %{x}<br>'
+                            '偏离倍数: %{y:.2f}<br>'
+                            '持续时长: %{customdata[0]}分钟<br>'
+                            '关联类型: ' + corr_type + '<br>'
+                            '<extra></extra>'
+                        )
+
                     fig.add_trace(go.Scatter(
                         x=sub['start_time'],
                         y=sub['peak_deviation_ratio'],
                         mode='markers',
                         name=corr_type,
                         marker=dict(
-                            size=10,
+                            size=marker_size,
                             color=color,
                             opacity=0.8,
                             line=dict(width=1, color='white')
                         ),
-                        hovertemplate=(
-                            '开始时间: %{x}<br>'
-                            '偏离倍数: %{y:.2f}<br>'
-                            '持续时长: %{customdata[0]}分钟<br>'
-                            '关联类型: ' + corr_type + '<br>'
-                            '<extra></extra>'
-                        ),
-                        customdata=sub[['duration_minutes']].values
+                        hovertemplate=hover_template,
+                        customdata=custom_data
                     ))
 
             fig.add_hline(
@@ -2265,62 +2333,152 @@ def page_anomaly_detection():
         st.subheader("3. 事件详情与关联分析")
 
         if total_events > 0:
+            view_detail = False
+            selected_event = None
+            if 'confidence_score' in filtered_events.columns and len(filtered_events) > 0:
+                all_event_ids = filtered_events['event_id'].tolist()
+
             col_left, col_right = st.columns([3, 2])
 
             with col_left:
                 st.markdown("##### 异常事件列表")
 
-                display_df = anomaly_events[[
-                    'event_id', 'start_time', 'end_time', 'duration_minutes',
-                    'peak_deviation_ratio', 'deviation_direction',
-                    'correlation_type', 'weather_event_types', 'calendar_info'
-                ]].copy()
+                col_export, col_sort = st.columns([1, 3])
+                with col_export:
+                    csv_export_columns = [
+                        'event_id', 'start_time', 'end_time', 'duration_minutes',
+                        'peak_deviation_ratio', 'deviation_direction',
+                        'correlation_type', 'weather_event_types', 'calendar_info'
+                    ]
+                    if 'confidence_score' in filtered_events.columns:
+                        csv_export_columns.insert(4, 'confidence_score')
 
-                display_df = display_df.rename(columns={
-                    'event_id': '事件ID',
-                    'start_time': '开始时间',
-                    'end_time': '结束时间',
-                    'duration_minutes': '持续时长(分钟)',
-                    'peak_deviation_ratio': '峰值偏离倍数',
-                    'deviation_direction': '偏离方向',
-                    'correlation_type': '关联类型',
-                    'weather_event_types': '关联气象',
-                    'calendar_info': '关联日历'
-                })
+                    csv_df = filtered_events[csv_export_columns].copy()
+                    csv_df = csv_df.rename(columns={
+                        'event_id': '事件ID',
+                        'start_time': '开始时间',
+                        'end_time': '结束时间',
+                        'duration_minutes': '持续时长(分钟)',
+                        'peak_deviation_ratio': '峰值偏离倍数',
+                        'deviation_direction': '偏离方向',
+                        'correlation_type': '关联类型',
+                        'weather_event_types': '关联气象',
+                        'calendar_info': '关联日历',
+                        'confidence_score': '置信度'
+                    })
+                    csv_buffer = io.StringIO()
+                    csv_df.to_csv(csv_buffer, index=False, encoding='utf-8-sig')
+                    csv_data = csv_buffer.getvalue()
 
-                sort_options = ['开始时间', '峰值偏离倍数', '持续时长(分钟)']
-                sort_by = st.selectbox(
-                    "按列排序",
-                    sort_options,
-                    index=0,
-                    key='event_sort'
+                    st.download_button(
+                        label="📥 导出CSV",
+                        data=csv_data,
+                        file_name=f"异常事件列表_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                        mime='text/csv',
+                        help="导出当前筛选条件下的事件列表为CSV文件"
+                    )
+
+                with col_sort:
+                    display_df = filtered_events[[
+                        'event_id', 'start_time', 'end_time', 'duration_minutes',
+                        'peak_deviation_ratio', 'deviation_direction',
+                        'correlation_type', 'weather_event_types', 'calendar_info'
+                    ]].copy()
+
+                    rename_columns = {
+                        'event_id': '事件ID',
+                        'start_time': '开始时间',
+                        'end_time': '结束时间',
+                        'duration_minutes': '持续时长(分钟)',
+                        'peak_deviation_ratio': '峰值偏离倍数',
+                        'deviation_direction': '偏离方向',
+                        'correlation_type': '关联类型',
+                        'weather_event_types': '关联气象',
+                        'calendar_info': '关联日历'
+                    }
+
+                    if 'confidence_score' in filtered_events.columns:
+                        display_df['confidence_score'] = filtered_events['confidence_score'].values
+                        rename_columns['confidence_score'] = '置信度'
+
+                    display_df = display_df.rename(columns=rename_columns)
+
+                    sort_options = ['开始时间', '峰值偏离倍数', '持续时长(分钟)']
+                    if '置信度' in display_df.columns:
+                        sort_options.insert(1, '置信度')
+                    sort_by = st.selectbox(
+                        "按列排序",
+                        sort_options,
+                        index=0,
+                        key='event_sort'
+                    )
+                    sort_asc = st.checkbox("升序", value=False, key='event_sort_asc')
+
+                    if sort_by == '开始时间':
+                        display_df = display_df.sort_values('开始时间', ascending=sort_asc)
+                    elif sort_by == '置信度':
+                        display_df = display_df.sort_values('置信度', ascending=sort_asc)
+                    elif sort_by == '峰值偏离倍数':
+                        display_df = display_df.sort_values('峰值偏离倍数', ascending=sort_asc)
+                    else:
+                        display_df = display_df.sort_values('持续时长(分钟)', ascending=sort_asc)
+
+                def highlight_confidence(val):
+                    if pd.isna(val):
+                        return ''
+                    try:
+                        val = int(val)
+                        if val >= 80:
+                            return 'background-color: #d4edda; color: #155724; font-weight: bold'
+                        elif val >= 60:
+                            return 'background-color: #fff3cd; color: #856404; font-weight: bold'
+                        else:
+                            return 'background-color: #f8d7da; color: #721c24; font-weight: bold'
+                    except:
+                        return ''
+
+                display_df['操作'] = display_df['事件ID'].apply(
+                    lambda x: f'<button onclick="event.preventDefault(); Streamlit.setComponentValue(\'detail_event_id\', {x})">查看详情</button>'
                 )
-                sort_asc = st.checkbox("升序", value=False, key='event_sort_asc')
 
-                if sort_by == '开始时间':
-                    display_df = display_df.sort_values('开始时间', ascending=sort_asc)
-                elif sort_by == '峰值偏离倍数':
-                    display_df = display_df.sort_values('峰值偏离倍数', ascending=sort_asc)
-                else:
-                    display_df = display_df.sort_values('持续时长(分钟)', ascending=sort_asc)
+                format_dict = {'峰值偏离倍数': '{:.2f}'}
+                if '置信度' in display_df.columns:
+                    format_dict['置信度'] = '{:d}'
+
+                styled_df = display_df.style.format(format_dict)
+                if '置信度' in display_df.columns:
+                    styled_df = styled_df.applymap(highlight_confidence, subset=['置信度'])
 
                 st.dataframe(
-                    display_df.style.format({
-                        '峰值偏离倍数': '{:.2f}'
-                    }),
+                    styled_df,
                     use_container_width=True,
-                    height=450
+                    height=400
                 )
+
+                if 'confidence_score' in filtered_events.columns:
+                    st.markdown("##### 事件详情查看")
+                    event_ids = display_df['事件ID'].tolist()
+                    event_labels = [
+                        f"事件 #{eid} - {display_df[display_df['事件ID'] == eid]['开始时间'].values[0].strftime('%Y-%m-%d %H:%M')}"
+                        for eid in event_ids
+                    ]
+                    selected_event = st.selectbox(
+                        "选择要查看详情的事件",
+                        options=event_ids,
+                        format_func=lambda x: event_labels[event_ids.index(x)] if x in event_ids else "",
+                        key='detail_selector'
+                    )
+                    view_detail = st.button("🔍 查看事件详情", key='view_detail_btn')
 
             with col_right:
                 st.markdown("##### 关联类型分布")
 
-                if correlation_stats is not None and len(correlation_stats) > 0:
-                    pie_colors = [color_map.get(t, '#718096') for t in correlation_stats['关联类型']]
+                if filtered_correlation_stats is not None and len(filtered_correlation_stats) > 0:
+                    pie_colors = [color_map.get(t, '#718096') for t in filtered_correlation_stats['关联类型']]
 
                     fig = go.Figure(data=[go.Pie(
-                        labels=correlation_stats['关联类型'],
-                        values=correlation_stats['事件数量'],
+                        labels=filtered_correlation_stats['关联类型'],
+                        values=filtered_correlation_stats['事件数量'],
                         hole=0.45,
                         marker=dict(colors=pie_colors),
                         textinfo='label+percent',
@@ -2332,7 +2490,7 @@ def page_anomaly_detection():
                         )
                     )])
                     fig.update_layout(
-                        title='异常事件关联类型占比',
+                        title='异常事件关联类型占比（筛选后）',
                         template='plotly_white',
                         height=280,
                         showlegend=False
@@ -2343,17 +2501,17 @@ def page_anomaly_detection():
 
                 st.markdown("##### 月度异常频次")
 
-                if monthly_stats is not None and len(monthly_stats) > 0:
+                if filtered_monthly_stats is not None and len(filtered_monthly_stats) > 0:
                     fig = go.Figure(data=[go.Bar(
-                        x=monthly_stats['month'],
-                        y=monthly_stats['异常事件数'],
+                        x=filtered_monthly_stats['month'],
+                        y=filtered_monthly_stats['异常事件数'],
                         marker_color='#1E3A5F',
-                        text=monthly_stats['异常事件数'],
+                        text=filtered_monthly_stats['异常事件数'],
                         textposition='outside',
                         hovertemplate='月份: %{x}<br>异常事件数: %{y}<extra></extra>'
                     )])
                     fig.update_layout(
-                        title='各月异常事件数量',
+                        title='各月异常事件数量（筛选后）',
                         xaxis_title='月份',
                         yaxis_title='异常事件数',
                         template='plotly_white',
@@ -2376,6 +2534,272 @@ def page_anomaly_detection():
                                 f"{int(row['事件数量'])} 件",
                                 f"{row['占比']*100:.1f}%"
                             )
+
+            if view_detail and selected_event is not None and len(filtered_events) > 0:
+                st.markdown("---")
+                st.subheader("5. 事件详情钻取")
+
+                event_data = filtered_events[filtered_events['event_id'] == selected_event]
+                if len(event_data) > 0:
+                    event_row = event_data.iloc[0]
+
+                    col_info1, col_info2, col_info3, col_info4 = st.columns(4)
+                    with col_info1:
+                        st.metric("事件ID", f"#{event_row['event_id']}")
+                    with col_info2:
+                        st.metric("开始时间", event_row['start_time'].strftime('%Y-%m-%d %H:%M'))
+                    with col_info3:
+                        st.metric("结束时间", event_row['end_time'].strftime('%Y-%m-%d %H:%M'))
+                    with col_info4:
+                        conf_score = event_row['confidence_score'] if 'confidence_score' in event_row else 0
+                        st.metric("置信度", f"{conf_score} 分")
+
+                    event_start = event_row['start_time']
+                    event_end = event_row['end_time']
+                    window_start = event_start - timedelta(hours=2)
+                    window_end = event_end + timedelta(hours=2)
+
+                    load_df_sorted = load_df.copy()
+                    if 'datetime' not in load_df_sorted.columns and load_df_sorted.index.name == 'datetime':
+                        load_df_sorted = load_df_sorted.reset_index()
+                    load_df_sorted['datetime'] = pd.to_datetime(load_df_sorted['datetime'])
+                    load_df_sorted = load_df_sorted.sort_values('datetime')
+
+                    window_mask = (load_df_sorted['datetime'] >= window_start) & (load_df_sorted['datetime'] <= window_end)
+                    window_data = load_df_sorted[window_mask].copy()
+
+                    if len(window_data) > 0:
+                        st.markdown("##### 5.1 负荷曲线（前后2小时）")
+
+                        fig_load = go.Figure()
+
+                        fig_load.add_trace(go.Scatter(
+                            x=window_data['datetime'],
+                            y=window_data['active_power_MW'],
+                            mode='lines+markers',
+                            name='实际负荷',
+                            line=dict(color='#1E3A5F', width=2),
+                            marker=dict(size=4)
+                        ))
+
+                        if 'baseline_median' in anomaly_points_df.columns:
+                            ap_window_mask = (anomaly_points_df['datetime'] >= window_start) & (anomaly_points_df['datetime'] <= window_end)
+                            ap_window_data = anomaly_points_df[ap_window_mask].copy()
+                            if len(ap_window_data) > 0 and 'baseline_median' in ap_window_data.columns:
+                                fig_load.add_trace(go.Scatter(
+                                    x=ap_window_data['datetime'],
+                                    y=ap_window_data['baseline_median'],
+                                    mode='lines',
+                                    name='基线中位数',
+                                    line=dict(color='#38B2AC', width=2, dash='dash')
+                                ))
+                                if 'baseline_std' in ap_window_data.columns:
+                                    upper_bound = ap_window_data['baseline_median'] + mad_threshold * ap_window_data['baseline_std']
+                                    lower_bound = ap_window_data['baseline_median'] - mad_threshold * ap_window_data['baseline_std']
+                                    fig_load.add_trace(go.Scatter(
+                                        x=ap_window_data['datetime'],
+                                        y=upper_bound,
+                                        mode='lines',
+                                        line=dict(color='rgba(220, 53, 69, 0.3)', width=0),
+                                        showlegend=False
+                                    ))
+                                    fig_load.add_trace(go.Scatter(
+                                        x=ap_window_data['datetime'],
+                                        y=lower_bound,
+                                        mode='lines',
+                                        fill='tonexty',
+                                        fillcolor='rgba(220, 53, 69, 0.1)',
+                                        line=dict(color='rgba(220, 53, 69, 0.3)', width=0),
+                                        name=f'±{mad_threshold}σ 阈值区间'
+                                    ))
+
+                        fig_load.add_vrect(
+                            x0=event_start,
+                            x1=event_end,
+                            fillcolor='rgba(220, 53, 69, 0.3)',
+                            layer='below',
+                            line_width=0,
+                            annotation_text='异常区间',
+                            annotation_position='top left'
+                        )
+
+                        fig_load.update_layout(
+                            title=f'事件 #{event_row["event_id"]} 负荷曲线分析',
+                            xaxis_title='时间',
+                            yaxis_title='有功负荷 MW',
+                            hovermode='x unified',
+                            template='plotly_white',
+                            height=400,
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                        )
+                        st_plot(fig_load, use_container_width=True)
+
+                        has_temp = 'temperature_C' in window_data.columns
+                        has_solar = 'solar_irradiance_Wm2' in window_data.columns
+
+                        if has_temp or has_solar:
+                            st.markdown("##### 5.2 气象要素曲线")
+
+                            if has_temp and has_solar:
+                                col_weather1, col_weather2 = st.columns(2)
+                            else:
+                                col_weather1 = st.container()
+                                col_weather2 = None
+
+                            if has_temp:
+                                with col_weather1:
+                                    fig_temp = go.Figure()
+                                    fig_temp.add_trace(go.Scatter(
+                                        x=window_data['datetime'],
+                                        y=window_data['temperature_C'],
+                                        mode='lines+markers',
+                                        name='气温',
+                                        line=dict(color='#E53E3E', width=2),
+                                        marker=dict(size=4)
+                                    ))
+
+                                    weather_window_mask = (weather_mutations_df['datetime'] >= window_start) & (weather_mutations_df['datetime'] <= window_end)
+                                    weather_window = weather_mutations_df[weather_window_mask]
+                                    if 'temp_mutation' in weather_window.columns:
+                                        temp_mutations = weather_window[weather_window['temp_mutation']]
+                                        for _, mut_row in temp_mutations.iterrows():
+                                            fig_temp.add_vline(
+                                                x=mut_row['datetime'],
+                                                line_dash='dash',
+                                                line_color='#E53E3E',
+                                                opacity=0.7,
+                                                annotation_text=f"突变 {mut_row.get('temp_diff', 0):.1f}°C",
+                                                annotation_position='top right'
+                                            )
+
+                                    fig_temp.add_vrect(
+                                        x0=event_start,
+                                        x1=event_end,
+                                        fillcolor='rgba(229, 62, 62, 0.1)',
+                                        layer='below',
+                                        line_width=0
+                                    )
+
+                                    fig_temp.update_layout(
+                                        title='气温变化曲线',
+                                        xaxis_title='时间',
+                                        yaxis_title='气温 °C',
+                                        hovermode='x unified',
+                                        template='plotly_white',
+                                        height=350
+                                    )
+                                    st_plot(fig_temp, use_container_width=True)
+
+                            if has_solar and col_weather2 is not None:
+                                with col_weather2:
+                                    fig_solar = go.Figure()
+                                    fig_solar.add_trace(go.Scatter(
+                                        x=window_data['datetime'],
+                                        y=window_data['solar_irradiance_Wm2'],
+                                        mode='lines+markers',
+                                        name='辐照度',
+                                        line=dict(color='#ED8936', width=2),
+                                        marker=dict(size=4)
+                                    ))
+
+                                    if 'solar_mutation' in weather_window.columns:
+                                        solar_mutations = weather_window[weather_window['solar_mutation']]
+                                        for _, mut_row in solar_mutations.iterrows():
+                                            fig_solar.add_vline(
+                                                x=mut_row['datetime'],
+                                                line_dash='dash',
+                                                line_color='#ED8936',
+                                                opacity=0.7,
+                                                annotation_text=f"突变 {mut_row.get('solar_diff', 0):.0f}W/m²",
+                                                annotation_position='top right'
+                                            )
+
+                                    fig_solar.add_vrect(
+                                        x0=event_start,
+                                        x1=event_end,
+                                        fillcolor='rgba(237, 137, 54, 0.1)',
+                                        layer='below',
+                                        line_width=0
+                                    )
+
+                                    fig_solar.update_layout(
+                                        title='太阳辐照度变化曲线',
+                                        xaxis_title='时间',
+                                        yaxis_title='辐照度 W/m²',
+                                        hovermode='x unified',
+                                        template='plotly_white',
+                                        height=350
+                                    )
+                                    st_plot(fig_solar, use_container_width=True)
+
+                        if 'related_weather_events' in event_row and event_row['related_weather_events']:
+                            st.markdown("##### 5.3 关联气象突变事件")
+                            weather_events_list = event_row['related_weather_events'].split('|')
+                            weather_event_data = []
+                            for we in weather_events_list:
+                                parts = we.split(': ', 1)
+                                if len(parts) == 2:
+                                    wtype = parts[0]
+                                    details = parts[1]
+                                    time_part, mag_part = details.split(', 突变幅度')
+                                    start_end = time_part.split('-')
+                                    if len(start_end) == 2:
+                                        weather_event_data.append({
+                                            '突变类型': wtype,
+                                            '开始时间': start_end[0],
+                                            '结束时间': start_end[1],
+                                            '突变幅度': mag_part
+                                        })
+
+                            if weather_event_data:
+                                we_df = pd.DataFrame(weather_event_data)
+                                st.dataframe(we_df, use_container_width=True)
+                            else:
+                                st.info("该事件暂未关联到具体的气象突变事件")
+                        else:
+                            st.info("该事件暂未关联到具体的气象突变事件")
+
+                        st.markdown("##### 5.4 置信度因子分析")
+                        conf_score = event_row['confidence_score'] if 'confidence_score' in event_row else 0
+                        peak_dev = abs(event_row['peak_deviation_ratio'])
+                        duration = event_row['duration_minutes']
+                        avg_samples = event_row['avg_baseline_samples'] if 'avg_baseline_samples' in event_row else 3
+
+                        dev_factor = min(peak_dev / mad_threshold * 40, 40)
+                        dur_factor = min(duration / 120 * 30, 30)
+                        samp_factor = min(avg_samples / 14 * 30, 30)
+
+                        col_factor1, col_factor2, col_factor3, col_factor4 = st.columns(4)
+                        with col_factor1:
+                            st.metric("偏离倍数因子", f"{dev_factor:.1f} / 40", f"峰值偏离: {peak_dev:.2f}σ")
+                        with col_factor2:
+                            st.metric("持续时长因子", f"{dur_factor:.1f} / 30", f"持续: {duration:.0f}分钟")
+                        with col_factor3:
+                            st.metric("样本量因子", f"{samp_factor:.1f} / 30", f"平均样本: {avg_samples:.1f}")
+                        with col_factor4:
+                            st.metric("总置信度", f"{conf_score} / 100",
+                                      delta=f"{'高' if conf_score >= 80 else '中' if conf_score >= 60 else '低'}置信度")
+
+                        fig_factor = go.Figure()
+                        fig_factor.add_trace(go.Bar(
+                            x=['偏离倍数因子', '持续时长因子', '样本量因子'],
+                            y=[dev_factor, dur_factor, samp_factor],
+                            text=[f'{dev_factor:.1f}/40', f'{dur_factor:.1f}/30', f'{samp_factor:.1f}/30'],
+                            textposition='auto',
+                            marker_color=['#3182CE', '#38A169', '#D69E2E']
+                        ))
+                        fig_factor.update_layout(
+                            title='置信度因子构成',
+                            yaxis_title='得分',
+                            yaxis=dict(range=[0, 45]),
+                            template='plotly_white',
+                            height=300
+                        )
+                        st_plot(fig_factor, use_container_width=True)
+                    else:
+                        st.warning("无法获取事件前后2小时的数据，可能数据范围不足")
+                else:
+                    st.warning("未找到选中的事件数据")
         else:
             st.info("未检测到异常事件，建议调整检测参数后重试")
 
