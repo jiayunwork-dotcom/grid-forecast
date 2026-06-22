@@ -143,19 +143,17 @@ def page_data_import():
         
         if load_file is not None:
             try:
-                load_df = read_csv_from_fileobj(load_file)
-                load_df, errors, warnings = validate_data(load_df, 'load')
+                load_df = read_csv_from_fileobj(load_file, standardize_names=False)
+                validation = validate_data(load_df, 'load')
                 
-                if errors:
-                    st.error(f"数据校验错误：{'; '.join(errors)}")
+                if not validation['is_valid']:
+                    st.error(f"数据校验错误：{'; '.join(validation['errors'])}")
                 else:
-                    if warnings:
-                        st.warning(f"数据校验警告：{'; '.join(warnings)}")
+                    if validation['warnings']:
+                        st.warning(f"数据校验警告：{'; '.join(validation['warnings'])}")
                     
-                    load_df = standardize_column_names(load_df)
                     load_df['datetime'] = pd.to_datetime(load_df['datetime'])
                     load_df = load_df.sort_values('datetime').reset_index(drop=True)
-                    load_df.set_index('datetime', inplace=True)
                     
                     st.session_state.load_data = load_df
                     st.success(f"✅ 成功加载负荷气象数据：{len(load_df)} 条记录")
@@ -175,16 +173,15 @@ def page_data_import():
         
         if calendar_file is not None:
             try:
-                cal_df = read_csv_from_fileobj(calendar_file)
-                cal_df, errors, warnings = validate_data(cal_df, 'calendar')
+                cal_df = read_csv_from_fileobj(calendar_file, standardize_names=False)
+                validation = validate_data(cal_df, 'calendar')
                 
-                if errors:
-                    st.error(f"数据校验错误：{'; '.join(errors)}")
+                if not validation['is_valid']:
+                    st.error(f"数据校验错误：{'; '.join(validation['errors'])}")
                 else:
-                    if warnings:
-                        st.warning(f"数据校验警告：{'; '.join(warnings)}")
+                    if validation['warnings']:
+                        st.warning(f"数据校验警告：{'; '.join(validation['warnings'])}")
                     
-                    cal_df = standardize_column_names(cal_df)
                     cal_df['date'] = pd.to_datetime(cal_df['date']).dt.date
                     
                     st.session_state.calendar_data = cal_df
@@ -201,13 +198,18 @@ def page_data_import():
         
         load_df = st.session_state.load_data
         
-        quality_score = calculate_quality_score(load_df)
+        load_df_for_check = load_df.reset_index() if load_df.index.name == 'datetime' else load_df
+        
+        quality_score = calculate_quality_score(load_df_for_check)
         missing_rate_df = calculate_missing_rate(load_df)
-        outliers_info = detect_outliers(load_df['active_power_MW'])
-        is_continuous, gaps = check_time_continuity(load_df.index)
+        outliers_info = detect_outliers(load_df)
+        continuity_info = check_time_continuity(load_df_for_check)
         duplicates_info = detect_duplicates(load_df)
         
-        quality_report = generate_quality_report(load_df)
+        quality_report = generate_quality_report(load_df_for_check)
+        
+        is_continuous = continuity_info.get('是否连续', False)
+        gaps = continuity_info.get('间隔列表', [])
         
         col1, col2, col3, col4 = st.columns(4)
         
@@ -216,12 +218,12 @@ def page_data_import():
             st.metric("数据质量评分", f"{quality_score:.1f}/100")
             
         with col2:
-            total_missing = missing_rate_df['missing_count'].sum()
+            total_missing = int(missing_rate_df['缺失数量'].sum())
             missing_pct = (total_missing / (len(load_df) * len(load_df.columns))) * 100
             st.metric("缺失数据", f"{total_missing} ({missing_pct:.2f}%)")
             
         with col3:
-            n_outliers = len(outliers_info['outlier_indices'])
+            n_outliers = sum(v['异常值数量'] for v in outliers_info.values())
             outlier_pct = (n_outliers / len(load_df)) * 100
             st.metric("异常值数量", f"{n_outliers} ({outlier_pct:.2f}%)")
             
@@ -229,7 +231,7 @@ def page_data_import():
             continuity_status = "✅ 连续" if is_continuous else "❌ 不连续"
             st.metric("时间连续性", continuity_status)
             if not is_continuous:
-                st.info(f"发现 {len(gaps)} 个时间间隔")
+                st.info(f"发现 {continuity_info.get('间隔数量', 0)} 个时间间隔")
         
         st.markdown("##### 质量检查报告")
         st.dataframe(quality_report, use_container_width=True)
@@ -260,8 +262,8 @@ def page_data_import():
             gaps_df = pd.DataFrame(gaps[:5], columns=['起始时间', '结束时间'])
             st.dataframe(gaps_df)
         
-        if duplicates_info['duplicate_count'] > 0:
-            st.warning(f"⚠️ 发现 {duplicates_info['duplicate_count']} 条重复数据")
+        if duplicates_info['重复数量'] > 0:
+            st.warning(f"⚠️ 发现 {duplicates_info['重复数量']} 条重复数据")
         
         st.markdown("---")
         st.subheader("3. 数据清洗")
@@ -286,13 +288,15 @@ def page_data_import():
             with st.spinner("正在清洗数据..."):
                 cleaned_df = clean_data(
                     load_df,
-                    fill_method=fill_method,
+                    missing_strategy=fill_method,
                     outlier_method=outlier_method,
-                    remove_duplicates=remove_dup
+                    remove_dupes=remove_dup
                 )
                 
                 st.session_state.load_data = cleaned_df
-                new_score = calculate_quality_score(cleaned_df)
+                new_score = calculate_quality_score(
+                    cleaned_df.reset_index() if cleaned_df.index.name == 'datetime' else cleaned_df
+                )
                 
                 st.success(f"✅ 数据清洗完成！数据质量评分：{quality_score:.1f} → {new_score:.1f}")
                 
@@ -314,7 +318,7 @@ def page_data_import():
         
         if selected_cols:
             fig = plot_time_series(
-                load_df.reset_index(),
+                load_df,
                 'datetime',
                 selected_cols,
                 title='时序数据概览'
@@ -327,11 +331,11 @@ def page_data_import():
         if st.button("生成预测特征"):
             with st.spinner("正在生成特征..."):
                 try:
+                    feat_df = load_df.reset_index() if load_df.index.name == 'datetime' else load_df.copy()
                     features_df = build_features(
-                        load_df,
-                        calendar_df=st.session_state.calendar_data,
-                        freq='15T',
-                        target_col='active_power_MW'
+                        feat_df,
+                        target_col='active_power_MW',
+                        freq='15min'
                     )
                     
                     st.session_state.features_df = features_df
@@ -438,9 +442,14 @@ def page_short_term_forecast():
                 features_df = st.session_state.features_df
                 load_df = st.session_state.load_data
                 
-                aligned_dates = features_df.index.intersection(load_df.index)
+                if 'datetime' in features_df.columns:
+                    features_df = features_df.set_index('datetime')
+                
+                load_indexed = load_df.set_index('datetime') if 'datetime' in load_df.columns else load_df
+                
+                aligned_dates = features_df.index.intersection(load_indexed.index)
                 features_df = features_df.loc[aligned_dates]
-                target = load_df.loc[aligned_dates, target_col]
+                target = load_indexed.loc[aligned_dates, target_col]
                 
                 feature_cols = [col for col in features_df.columns if col != target_col]
                 X = features_df[feature_cols].values
@@ -962,23 +971,16 @@ def page_peak_valley_analysis():
         if st.button("🔍 重新执行峰谷分析") or st.session_state.peak_valley_result is None:
             with st.spinner("正在执行峰谷分析..."):
                 try:
-                    analyzer = PeakValleyAnalyzer()
+                    analyzer = PeakValleyAnalyzer(target_col='active_power_MW')
                     
-                    daily_features = analyzer.extract_daily_features(
-                        load_df.reset_index(),
-                        datetime_col='datetime',
-                        load_col=target_col
-                    )
+                    daily_features = analyzer.extract_daily_peak_valley(load_df)
+                    
+                    peak_duration = analyzer.calculate_peak_duration(load_df)
                     
                     peak_valley_result = {
                         'daily_features': daily_features,
-                        'monthly_trend': analyzer.analyze_monthly_trend(daily_features),
-                        'spike_periods': analyzer.detect_spike_periods(
-                            load_df.reset_index(),
-                            datetime_col='datetime',
-                            load_col=target_col,
-                            threshold_ratio=1.2
-                        )
+                        'peak_duration': peak_duration,
+                        'monthly_trend': analyzer.aggregate_monthly_features(daily_features)
                     }
                     
                     st.session_state.peak_valley_result = peak_valley_result
@@ -996,30 +998,29 @@ def page_peak_valley_analysis():
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
-            avg_peak = daily_features['peak_value_MW'].mean()
+            avg_peak = daily_features['peak_value'].mean()
             st.metric("平均峰值", f"{avg_peak:.2f} MW")
         
         with col2:
-            avg_valley = daily_features['valley_value_MW'].mean()
+            avg_valley = daily_features['valley_value'].mean()
             st.metric("平均谷值", f"{avg_valley:.2f} MW")
         
         with col3:
-            avg_diff = daily_features['peak_valley_diff_MW'].mean()
+            avg_diff = daily_features['peak_valley_diff'].mean()
             st.metric("平均峰谷差", f"{avg_diff:.2f} MW")
         
         with col4:
-            avg_load_rate = daily_features['load_rate'].mean() * 100
+            avg_load_rate = daily_features['daily_load_rate'].mean() * 100
             st.metric("平均日负荷率", f"{avg_load_rate:.2f}%")
         
         st.markdown("##### 日峰谷特征详情")
         st.dataframe(
             daily_features.style.format({
-                'peak_value_MW': '{:.2f}',
-                'valley_value_MW': '{:.2f}',
-                'peak_valley_diff_MW': '{:.2f}',
-                'mean_value_MW': '{:.2f}',
-                'load_rate': '{:.2%}',
-                'spike_duration_hours': '{:.2f}'
+                'peak_value': '{:.2f}',
+                'valley_value': '{:.2f}',
+                'peak_valley_diff': '{:.2f}',
+                'mean_value': '{:.2f}',
+                'daily_load_rate': '{:.2%}',
             }),
             use_container_width=True
         )
@@ -1036,8 +1037,8 @@ def page_peak_valley_analysis():
         
         selected_datetime = pd.to_datetime(selected_date)
         day_data = load_df[
-            (load_df.index.date == selected_datetime.date())
-        ].reset_index()
+            pd.to_datetime(load_df['datetime']).dt.date == selected_datetime.date()
+        ].copy()
         
         if len(day_data) > 0:
             day_features = daily_features[daily_features['date'] == selected_date].iloc[0]
@@ -1048,7 +1049,7 @@ def page_peak_valley_analysis():
                 target_col,
                 peak_time=day_features['peak_time'],
                 valley_time=day_features['valley_time'],
-                threshold=day_features['mean_value_MW'] * 1.2,
+                threshold=day_features['mean_value'] * 1.2,
                 title=f"{selected_date} 日负荷曲线"
             )
             st_plot(fig, use_container_width=True)
@@ -1059,9 +1060,10 @@ def page_peak_valley_analysis():
             with col2:
                 st.info(f"🕐 谷值时刻：{day_features['valley_time']}")
             with col3:
-                st.info(f"📊 峰谷差：{day_features['peak_valley_diff_MW']:.2f} MW")
+                st.info(f"📊 峰谷差：{day_features['peak_valley_diff']:.2f} MW")
             with col4:
-                st.info(f"⏱️ 尖峰时长：{day_features['spike_duration_hours']:.2f} 小时")
+                spike_h = result['peak_duration']['peak_duration_hours'].mean() if 'peak_duration' in result else 0
+                st.info(f"⏱️ 平均尖峰时长：{spike_h:.2f} 小时")
         
         st.markdown("---")
         st.subheader("3. 月度趋势分析")
@@ -1076,7 +1078,7 @@ def page_peak_valley_analysis():
             
             fig.add_trace(go.Scatter(
                 x=monthly_trend['month'],
-                y=monthly_trend['avg_peak_value_MW'],
+                y=monthly_trend['avg_peak_value'],
                 mode='lines+markers',
                 name='平均峰值',
                 line=dict(color='#dc3545', width=2)
@@ -1084,18 +1086,10 @@ def page_peak_valley_analysis():
             
             fig.add_trace(go.Scatter(
                 x=monthly_trend['month'],
-                y=monthly_trend['avg_valley_value_MW'],
+                y=monthly_trend['avg_valley_value'],
                 mode='lines+markers',
                 name='平均谷值',
                 line=dict(color='#28a745', width=2)
-            ))
-            
-            fig.add_trace(go.Scatter(
-                x=monthly_trend['month'],
-                y=monthly_trend['avg_mean_value_MW'],
-                mode='lines+markers',
-                name='平均值',
-                line=dict(color='#1E3A5F', width=2, dash='dash')
             ))
             
             fig.update_layout(
@@ -1112,7 +1106,7 @@ def page_peak_valley_analysis():
             
             fig.add_trace(go.Bar(
                 x=monthly_trend['month'],
-                y=monthly_trend['avg_peak_valley_diff_MW'],
+                y=monthly_trend['avg_peak_valley_diff'],
                 name='平均峰谷差',
                 yaxis='y',
                 marker_color='#38B2AC'
@@ -1120,7 +1114,7 @@ def page_peak_valley_analysis():
             
             fig.add_trace(go.Scatter(
                 x=monthly_trend['month'],
-                y=monthly_trend['avg_load_rate'] * 100,
+                y=monthly_trend['avg_daily_load_rate'] * 100,
                 mode='lines+markers',
                 name='平均负荷率',
                 yaxis='y2',
@@ -1152,47 +1146,42 @@ def page_peak_valley_analysis():
         st.markdown("---")
         st.subheader("4. 尖峰时段分析")
         
-        spike_periods = result['spike_periods']
+        peak_duration = result['peak_duration']
         
-        if len(spike_periods) > 0:
-            st.info(f"📊 共识别 {len(spike_periods)} 个尖峰时段（超过日均值120%）")
+        if peak_duration is not None and len(peak_duration) > 0:
+            avg_spike = peak_duration['peak_duration_hours'].mean()
+            st.info(f"📊 共分析 {len(peak_duration)} 天，平均尖峰时长 {avg_spike:.2f} 小时（超过日均值120%）")
             
             col1, col2 = st.columns(2)
             
             with col1:
-                spike_hours = [p['start_time'].hour for p in spike_periods]
-                spike_hour_dist = pd.Series(spike_hours).value_counts().sort_index()
-                
-                fig = go.Figure(data=[go.Bar(
-                    x=spike_hour_dist.index,
-                    y=spike_hour_dist.values,
-                    marker_color='#dc3545'
-                )])
-                fig.update_layout(
-                    title='尖峰时段小时分布',
-                    xaxis_title='小时',
-                    yaxis_title='尖峰发生次数'
-                )
-                st_plot(fig, use_container_width=True)
-            
-            with col2:
-                spike_durations = [p['duration_hours'] for p in spike_periods]
-                
                 fig = go.Figure(data=[go.Histogram(
-                    x=spike_durations,
+                    x=peak_duration['peak_duration_hours'],
                     nbinsx=20,
-                    marker_color='#ED8936'
+                    marker_color='#dc3545'
                 )])
                 fig.update_layout(
                     title='尖峰持续时间分布',
                     xaxis_title='持续时间(小时)',
-                    yaxis_title='频次'
+                    yaxis_title='天数'
                 )
                 st_plot(fig, use_container_width=True)
             
-            st.markdown("##### 尖峰时段详情（前10条）")
-            spike_df = pd.DataFrame(spike_periods[:10])
-            st.dataframe(spike_df, use_container_width=True)
+            with col2:
+                fig = go.Figure(data=[go.Bar(
+                    x=peak_duration['date'].astype(str),
+                    y=peak_duration['peak_duration_hours'],
+                    marker_color='#ED8936'
+                )])
+                fig.update_layout(
+                    title='每日尖峰时长',
+                    xaxis_title='日期',
+                    yaxis_title='尖峰时长(小时)'
+                )
+                st_plot(fig, use_container_width=True)
+            
+            st.markdown("##### 尖峰时段详情（前10天）")
+            st.dataframe(peak_duration.head(10), use_container_width=True)
         else:
             st.info("未识别到尖峰时段")
 
@@ -1215,11 +1204,11 @@ def page_demand_response():
     else:
         daily_features = st.session_state.peak_valley_result['daily_features']
         dr_potential = {
-            'peak_load_MW': daily_features['peak_value_MW'].max(),
-            'valley_load_MW': daily_features['valley_value_MW'].min(),
-            'mean_load_MW': daily_features['mean_value_MW'].mean(),
-            'peak_valley_diff_MW': daily_features['peak_valley_diff_MW'].mean(),
-            'shaving_potential_pct': (daily_features['peak_valley_diff_MW'].mean() / daily_features['peak_value_MW'].max() * 100)
+            'peak_load_MW': daily_features['peak_value'].max(),
+            'valley_load_MW': daily_features['valley_value'].min(),
+            'mean_load_MW': daily_features['mean_value'].mean(),
+            'peak_valley_diff_MW': daily_features['peak_valley_diff'].mean(),
+            'shaving_potential_pct': (daily_features['peak_valley_diff'].mean() / daily_features['peak_value'].max() * 100)
         }
     
     st.subheader("1. 需求响应潜力分析")

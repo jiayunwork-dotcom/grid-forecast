@@ -432,9 +432,17 @@ def analyze_dr_potential(load_df: pd.DataFrame, load_col: str = 'active_power_MW
     dr_potential_mw = peak_val - valley_val
     dr_potential_mwh = dr_potential_mw * peak_hours_count
     
-    hourly_profile = load_df.resample('H')[load_col].mean()
-    peak_period_hour = hourly_profile.idxmax().hour
-    valley_period_hour = hourly_profile.idxmin().hour
+    temp_df = load_df.copy()
+    if 'datetime' in temp_df.columns and temp_df.index.name != 'datetime':
+        temp_df = temp_df.set_index('datetime')
+    
+    if isinstance(temp_df.index, pd.DatetimeIndex):
+        hourly_profile = temp_df[load_col].resample('h').mean()
+        peak_period_hour = hourly_profile.idxmax().hour
+        valley_period_hour = hourly_profile.idxmin().hour
+    else:
+        peak_period_hour = 0
+        valley_period_hour = 0
     
     return {
         'peak_load_MW': peak_val,

@@ -6,22 +6,26 @@ from datetime import datetime
 
 STANDARD_COLUMN_MAPPING: Dict[str, List[str]] = {
     'datetime': ['datetime', '时间', '日期时间', 'timestamp', 'date_time', 'dt'],
-    'load': ['load', '负荷', '用电负荷', 'power', 'power_load', 'active_power'],
-    'temperature': ['temperature', '温度', '气温', 'temp', 't'],
-    'humidity': ['humidity', '湿度', '相对湿度', 'rh', 'h'],
+    'load': ['load', '负荷', '用电负荷', 'power', 'power_load', 'active_power', 'active_power_MW', '有功负荷', '有功功率'],
+    'reactive_power': ['reactive_power', '无功负荷', '无功功率', 'reactive_power_MVar'],
+    'voltage': ['voltage', '电压', 'voltage_kV'],
+    'temperature': ['temperature', '温度', '气温', 'temp', 't', 'temperature_C'],
+    'humidity': ['humidity', '湿度', '相对湿度', 'rh', 'h', 'humidity_pct'],
     'pressure': ['pressure', '气压', '大气压', 'pres', 'p'],
-    'wind_speed': ['wind_speed', '风速', '风力', 'ws', 'wind'],
+    'wind_speed': ['wind_speed', '风速', '风力', 'ws', 'wind', 'wind_speed_ms'],
     'wind_direction': ['wind_direction', '风向', 'wd'],
     'precipitation': ['precipitation', '降水量', '降雨', 'precip', 'rain'],
-    'sunshine': ['sunshine', '日照', '日照时数', 'sun'],
+    'solar_irradiance': ['sunshine', '日照', '日照时数', 'sun', 'solar_irradiance', 'solar_irradiance_Wm2', '太阳辐照度'],
     'holiday': ['holiday', '节假日', '是否节假日', 'is_holiday'],
     'workday': ['workday', '工作日', '是否工作日', 'is_workday'],
+    'day_type': ['day_type', '日类型', '日期类型'],
+    'special_event': ['special_event', '特殊事件', '事件标记'],
     'date': ['date', '日期', 'dt_date'],
 }
 
 NUMERIC_FIELDS: List[str] = [
-    'load', 'temperature', 'humidity', 'pressure', 'wind_speed',
-    'wind_direction', 'precipitation', 'sunshine', 'holiday', 'workday'
+    'load', 'reactive_power', 'voltage', 'temperature', 'humidity', 'pressure', 'wind_speed',
+    'wind_direction', 'precipitation', 'solar_irradiance', 'holiday', 'workday'
 ]
 
 DATETIME_FORMATS: List[str] = [
@@ -39,13 +43,16 @@ REQUIRED_FIELDS_LOAD: List[str] = ['datetime', 'load']
 REQUIRED_FIELDS_CALENDAR: List[str] = ['date']
 
 VALID_RANGES: Dict[str, Tuple[float, float]] = {
+    'load': (0.0, 500.0),
+    'reactive_power': (-200.0, 200.0),
+    'voltage': (80.0, 250.0),
     'temperature': (-40.0, 50.0),
     'humidity': (0.0, 100.0),
     'pressure': (800.0, 1100.0),
     'wind_speed': (0.0, 100.0),
     'wind_direction': (0.0, 360.0),
     'precipitation': (0.0, 1000.0),
-    'sunshine': (0.0, 24.0),
+    'solar_irradiance': (0.0, 1500.0),
     'holiday': (0.0, 1.0),
     'workday': (0.0, 1.0),
 }
@@ -194,12 +201,23 @@ def check_required_fields(
 
     Args:
         df: 输入的DataFrame。
-        required_fields: 必填字段列表。
+        required_fields: 必填字段列表（标准名称）。
 
     Returns:
         元组(是否包含所有必填字段, 缺失的字段列表)。
     """
-    missing_fields = [field for field in required_fields if field not in df.columns]
+    missing_fields = []
+    for field in required_fields:
+        if field in df.columns:
+            continue
+        found = False
+        if field in STANDARD_COLUMN_MAPPING:
+            for alias in STANDARD_COLUMN_MAPPING[field]:
+                if alias in df.columns:
+                    found = True
+                    break
+        if not found:
+            missing_fields.append(field)
     return (len(missing_fields) == 0, missing_fields)
 
 
@@ -211,7 +229,7 @@ def check_value_ranges(
 
     Args:
         df: 输入的DataFrame。
-        valid_ranges: 有效范围字典，键为列名，值为(最小值, 最大值)元组。
+        valid_ranges: 有效范围字典，键为标准列名，值为(最小值, 最大值)元组。
 
     Returns:
         范围违规信息字典，键为列名，值为包含count、valid_range和indices的字典。
@@ -221,17 +239,26 @@ def check_value_ranges(
     
     range_violations: Dict[str, Dict[str, Any]] = {}
     
-    for col, (min_val, max_val) in valid_ranges.items():
-        if col not in df.columns:
+    for standard_col, (min_val, max_val) in valid_ranges.items():
+        actual_col = None
+        if standard_col in df.columns:
+            actual_col = standard_col
+        elif standard_col in STANDARD_COLUMN_MAPPING:
+            for alias in STANDARD_COLUMN_MAPPING[standard_col]:
+                if alias in df.columns:
+                    actual_col = alias
+                    break
+        
+        if actual_col is None:
             continue
         
-        series = pd.to_numeric(df[col], errors='coerce')
+        series = pd.to_numeric(df[actual_col], errors='coerce')
         violations = (series < min_val) | (series > max_val)
         violation_count = violations.sum()
         
         if violation_count > 0:
             violation_indices = df.index[violations].tolist()
-            range_violations[col] = {
+            range_violations[actual_col] = {
                 'count': int(violation_count),
                 'valid_range': (min_val, max_val),
                 'indices': violation_indices
@@ -289,8 +316,14 @@ def validate_data(
                 f"datetime 字段有 {null_datetime} 个无效时间戳"
             )
     
-    if 'load' in df.columns:
-        load_series = pd.to_numeric(df['load'], errors='coerce')
+    load_col = None
+    for candidate in ['load'] + STANDARD_COLUMN_MAPPING.get('load', []):
+        if candidate in df.columns:
+            load_col = candidate
+            break
+    
+    if load_col is not None:
+        load_series = pd.to_numeric(df[load_col], errors='coerce')
         negative_load = (load_series < 0).sum()
         if negative_load > 0:
             validation_result['warnings'].append(
