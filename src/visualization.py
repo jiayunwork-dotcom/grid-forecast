@@ -148,6 +148,109 @@ def plot_missing_heatmap(df: pd.DataFrame, title: str = '缺失率热力图') ->
     return fig
 
 
+def plot_model_comparison(df: pd.DataFrame, datetime_col: str, actual_col: str, 
+                          lgbm_pred_col: str, lstm_pred_col: str, 
+                          lgbm_mape: float, lstm_mape: float,
+                          title: str = '双模型预测对比', xlabel: str = '时间', ylabel: str = '负荷 MW') -> Figure:
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=df[datetime_col], 
+        y=df[actual_col], 
+        mode='lines', 
+        name='实际值',
+        line=dict(color='#1E3A5F', width=3),
+        hovertemplate='实际值: %{y:.2f} MW<br>时间: %{x}<extra></extra>'
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=df[datetime_col], 
+        y=df[lgbm_pred_col], 
+        mode='lines', 
+        name=f'LightGBM (MAPE: {lgbm_mape:.2f}%)',
+        line=dict(color='#38B2AC', width=2, dash='solid'),
+        hovertemplate='LightGBM预测: %{y:.2f} MW<br>时间: %{x}<extra></extra>'
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=df[datetime_col], 
+        y=df[lstm_pred_col], 
+        mode='lines', 
+        name=f'LSTM (MAPE: {lstm_mape:.2f}%)',
+        line=dict(color='#ED8936', width=2, dash='dash'),
+        hovertemplate='LSTM预测: %{y:.2f} MW<br>时间: %{x}<extra></extra>'
+    ))
+    
+    fig.update_layout(
+        title=title, 
+        xaxis_title=xlabel, 
+        yaxis_title=ylabel, 
+        hovermode='x unified',
+        legend=dict(
+            orientation='h', 
+            yanchor='bottom', 
+            y=1.02, 
+            xanchor='right', 
+            x=1
+        ), 
+        template='plotly_white',
+        height=500
+    )
+    
+    return fig
+
+
+def plot_period_mape_comparison(lgbm_period_mapes: Dict[str, float], 
+                                   lstm_period_mapes: Dict[str, float],
+                                   title: str = '分时段MAPE对比') -> Figure:
+    periods = list(lgbm_period_mapes.keys())
+    lgbm_values = list(lgbm_period_mapes.values())
+    lstm_values = list(lstm_period_mapes.values())
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=periods,
+        y=lgbm_values,
+        name='LightGBM',
+        marker_color='#38B2AC',
+        text=[f'{v:.2f}%' for v in lgbm_values],
+        textposition='outside',
+        hovertemplate='LightGBM<br>%{x}<br>MAPE: %{y:.2f}%<extra></extra>'
+    ))
+    
+    fig.add_trace(go.Bar(
+        x=periods,
+        y=lstm_values,
+        name='LSTM',
+        marker_color='#ED8936',
+        text=[f'{v:.2f}%' for v in lstm_values],
+        textposition='outside',
+        hovertemplate='LSTM<br>%{x}<br>MAPE: %{y:.2f}%<extra></extra>'
+    ))
+    
+    fig.update_layout(
+        title=title,
+        xaxis_title='时段',
+        yaxis_title='MAPE (%)',
+        barmode='group',
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='right',
+            x=1
+        ),
+        template='plotly_white',
+        height=450,
+        yaxis=dict(
+            ticksuffix='%'
+        )
+    )
+    
+    return fig
+
+
 def st_plot(fig: Figure, use_container_width: bool = True) -> None:
     try:
         import streamlit as st

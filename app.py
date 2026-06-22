@@ -34,9 +34,13 @@ from src.visualization import (
     plot_time_series, plot_prediction_comparison, plot_feature_importance,
     plot_error_distribution, plot_error_vs_temperature, plot_peak_valley,
     plot_dispatch_comparison, plot_resource_stack, plot_missing_heatmap,
+    plot_model_comparison, plot_period_mape_comparison,
     st_plot
 )
-from src.utils import mape, rmse, format_number, format_percentage
+from src.utils import (
+    mape, rmse, mae, format_number, format_percentage,
+    calculate_all_metrics, calculate_period_mape, recommend_models
+)
 
 st.set_page_config(
     page_title="区域电网负荷预测与需求响应优化分析系统",
@@ -123,6 +127,8 @@ if 'ultra_short_result' not in st.session_state:
     st.session_state.ultra_short_result = None
 if 'short_term_model' not in st.session_state:
     st.session_state.short_term_model = None
+if 'model_comparison_result' not in st.session_state:
+    st.session_state.model_comparison_result = None
 
 def page_data_import():
     st.header("📊 数据导入与质量检查")
@@ -692,6 +698,323 @@ def page_short_term_forecast():
             }),
             use_container_width=True
         )
+    
+    st.markdown("---")
+    st.subheader("6. 模型对比分析")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        compare_train_ratio = st.slider(
+            "训练集比例(对比)",
+            min_value=0.6,
+            max_value=0.9,
+            value=0.8,
+            step=0.05,
+            key='compare_train_ratio'
+        )
+    with col2:
+        compare_days = st.slider(
+            "对比测试天数",
+            min_value=1,
+            max_value=14,
+            value=7,
+            key='compare_days'
+        )
+    with col3:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 开始模型对比", type="primary", key='compare_button'):
+            with st.spinner("正在训练双模型并进行对比分析..."):
+                try:
+                    features_df = st.session_state.features_df
+                    load_df = st.session_state.load_data
+                    target_col = 'active_power_MW'
+                    
+                    if 'datetime' in features_df.columns:
+                        features_df = features_df.set_index('datetime')
+                    
+                    load_indexed = load_df.set_index('datetime') if 'datetime' in load_df.columns else load_df
+                    
+                    aligned_dates = features_df.index.intersection(load_indexed.index)
+                    features_df = features_df.loc[aligned_dates]
+                    target = load_indexed.loc[aligned_dates, target_col]
+                    
+                    feature_cols = [col for col in features_df.columns if col != target_col]
+                    X = features_df[feature_cols].values
+                    y = target.values
+                    
+                    test_samples = min(compare_days * 96, len(X) - int(len(X) * compare_train_ratio))
+                    train_size = len(X) - test_samples
+                    
+                    X_train, y_train = X[:train_size], y[:train_size]
+                    X_test, y_test = X[train_size:], y[train_size:]
+                    test_dates = features_df.index[train_size:]
+                    
+                    lgbm_params = {
+                        'num_leaves': 63,
+                        'learning_rate': 0.05,
+                        'n_estimators': 1000,
+                        'objective': 'regression',
+                        'metric': ['mape', 'rmse'],
+                        'feature_fraction': 0.9,
+                        'bagging_fraction': 0.8,
+                        'bagging_freq': 5,
+                        'verbose': -1
+                    }
+                    
+                    from lightgbm import LGBMRegressor
+                    lgbm_model = LGBMRegressor(**lgbm_params)
+                    lgbm_model.fit(X_train, y_train, callbacks=[])
+                    lgbm_pred = lgbm_model.predict(X_test)
+                    
+                    seq_length = 96
+                    n_features = len(feature_cols)
+                    
+                    def create_sequences(X, y, seq_len):
+                        X_seq, y_seq = [], []
+                        for i in range(len(X) - seq_len):
+                            X_seq.append(X[i:i+seq_len])
+                            y_seq.append(y[i+seq_len])
+                        return np.array(X_seq), np.array(y_seq)
+                    
+                    X_train_seq, y_train_seq = create_sequences(X_train, y_train, seq_length)
+                    X_test_seq, y_test_seq = create_sequences(X_test, y_test, seq_length)
+                    test_dates_lstm = test_dates[seq_length:]
+                    
+                    import torch
+                    import torch.nn as nn
+                    from torch.utils.data import TensorDataset, DataLoader
+                    
+                    class LSTMModel(nn.Module):
+                        def __init__(self, input_dim, hidden_dim, dropout_rate):
+                            super().__init__()
+                            self.lstm1 = nn.LSTM(input_dim, hidden_dim, batch_first=True, bidirectional=False)
+                            self.dropout1 = nn.Dropout(dropout_rate)
+                            self.lstm2 = nn.LSTM(hidden_dim, hidden_dim//2, batch_first=True, bidirectional=False)
+                            self.dropout2 = nn.Dropout(dropout_rate)
+                            self.fc1 = nn.Linear(hidden_dim//2, 32)
+                            self.relu = nn.ReLU()
+                            self.fc2 = nn.Linear(32, 1)
+                            
+                        def forward(self, x):
+                            x, _ = self.lstm1(x)
+                            x = self.dropout1(x)
+                            x, _ = self.lstm2(x)
+                            x = self.dropout2(x[:, -1, :])
+                            x = self.fc1(x)
+                            x = self.relu(x)
+                            x = self.fc2(x)
+                            return x.squeeze()
+                    
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    lstm_model = LSTMModel(n_features, 128, 0.2).to(device)
+                    
+                    X_train_tensor = torch.FloatTensor(X_train_seq).to(device)
+                    y_train_tensor = torch.FloatTensor(y_train_seq).to(device)
+                    X_test_tensor = torch.FloatTensor(X_test_seq).to(device)
+                    
+                    optimizer = torch.optim.Adam(lstm_model.parameters(), lr=0.001)
+                    criterion = nn.MSELoss()
+                    
+                    batch_size = 64
+                    dataset = TensorDataset(X_train_tensor, y_train_tensor)
+                    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                    
+                    epochs = 50
+                    best_val_loss = float('inf')
+                    patience = 10
+                    counter = 0
+                    
+                    val_size = int(len(X_train_seq) * 0.1)
+                    X_val_tensor = X_train_tensor[-val_size:]
+                    y_val_tensor = y_train_tensor[-val_size:]
+                    X_train_tensor = X_train_tensor[:-val_size]
+                    y_train_tensor = y_train_tensor[:-val_size]
+                    
+                    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+                    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+                    
+                    for epoch in range(epochs):
+                        lstm_model.train()
+                        for batch_X, batch_y in train_dataloader:
+                            optimizer.zero_grad()
+                            outputs = lstm_model(batch_X)
+                            loss = criterion(outputs, batch_y)
+                            loss.backward()
+                            optimizer.step()
+                        
+                        lstm_model.eval()
+                        with torch.no_grad():
+                            val_outputs = lstm_model(X_val_tensor)
+                            val_loss = criterion(val_outputs, y_val_tensor)
+                        
+                        if val_loss < best_val_loss:
+                            best_val_loss = val_loss
+                            counter = 0
+                        else:
+                            counter += 1
+                            if counter >= patience:
+                                break
+                    
+                    lstm_model.eval()
+                    with torch.no_grad():
+                        lstm_pred = lstm_model(X_test_tensor).cpu().numpy()
+                    
+                    common_len = min(len(lgbm_pred) - seq_length, len(lstm_pred))
+                    lgbm_pred_aligned = lgbm_pred[seq_length:seq_length + common_len]
+                    y_test_aligned = y_test[seq_length:seq_length + common_len]
+                    test_dates_aligned = test_dates[seq_length:seq_length + common_len]
+                    
+                    lgbm_metrics = calculate_all_metrics(y_test_aligned, lgbm_pred_aligned)
+                    lstm_metrics = calculate_all_metrics(y_test_aligned, lstm_pred)
+                    
+                    comparison_df = pd.DataFrame({
+                        'datetime': test_dates_aligned,
+                        'actual': y_test_aligned,
+                        'lightgbm_pred': lgbm_pred_aligned,
+                        'lstm_pred': lstm_pred
+                    })
+                    
+                    lgbm_period_mapes = calculate_period_mape(
+                        comparison_df, 'datetime', 'actual', 'lightgbm_pred'
+                    )
+                    lstm_period_mapes = calculate_period_mape(
+                        comparison_df, 'datetime', 'actual', 'lstm_pred'
+                    )
+                    
+                    recommendations, recommendation_summary = recommend_models(
+                        lgbm_period_mapes, lstm_period_mapes
+                    )
+                    
+                    st.session_state.model_comparison_result = {
+                        'comparison_df': comparison_df,
+                        'lgbm_metrics': lgbm_metrics,
+                        'lstm_metrics': lstm_metrics,
+                        'lgbm_period_mapes': lgbm_period_mapes,
+                        'lstm_period_mapes': lstm_period_mapes,
+                        'recommendations': recommendations,
+                        'recommendation_summary': recommendation_summary
+                    }
+                    
+                    st.success("✅ 模型对比分析完成！")
+                    
+                except Exception as e:
+                    st.error(f"模型对比失败：{str(e)}")
+                    import traceback
+                    st.error(traceback.format_exc())
+    
+    if st.session_state.model_comparison_result is not None:
+        comp_result = st.session_state.model_comparison_result
+        comparison_df = comp_result['comparison_df']
+        lgbm_metrics = comp_result['lgbm_metrics']
+        lstm_metrics = comp_result['lstm_metrics']
+        lgbm_period_mapes = comp_result['lgbm_period_mapes']
+        lstm_period_mapes = comp_result['lstm_period_mapes']
+        recommendations = comp_result['recommendations']
+        recommendation_summary = comp_result['recommendation_summary']
+        
+        st.markdown("##### 6.1 预测曲线对比")
+        fig = plot_model_comparison(
+            comparison_df,
+            'datetime',
+            'actual',
+            'lightgbm_pred',
+            'lstm_pred',
+            lgbm_metrics['mape'],
+            lstm_metrics['mape'],
+            title='LightGBM vs LSTM 预测结果对比'
+        )
+        st_plot(fig, use_container_width=True)
+        
+        st.markdown("##### 6.2 综合指标对比")
+        
+        metrics_table = pd.DataFrame({
+            '指标': ['MAPE (%)', 'RMSE (MW)', 'MAE (MW)', '最大单点误差 (%)', '预测偏移方向'],
+            'LightGBM': [
+                f"{lgbm_metrics['mape']:.2f}%",
+                f"{lgbm_metrics['rmse']:.2f}",
+                f"{lgbm_metrics['mae']:.2f}",
+                f"{lgbm_metrics['max_ape']:.2f}%",
+                lgbm_metrics['bias']
+            ],
+            'LSTM': [
+                f"{lstm_metrics['mape']:.2f}%",
+                f"{lstm_metrics['rmse']:.2f}",
+                f"{lstm_metrics['mae']:.2f}",
+                f"{lstm_metrics['max_ape']:.2f}%",
+                lstm_metrics['bias']
+            ]
+        })
+        
+        def highlight_recommended_row(row):
+            if row.name == 'MAPE (%)':
+                lgbm_val = lgbm_metrics['mape']
+                lstm_val = lstm_metrics['mape']
+                if lgbm_val < lstm_val:
+                    return ['', 'background-color: #d4edda; color: #155724', '']
+                else:
+                    return ['', '', 'background-color: #d4edda; color: #155724']
+            elif row.name == 'RMSE (MW)':
+                lgbm_val = lgbm_metrics['rmse']
+                lstm_val = lstm_metrics['rmse']
+                if lgbm_val < lstm_val:
+                    return ['', 'background-color: #d4edda; color: #155724', '']
+                else:
+                    return ['', '', 'background-color: #d4edda; color: #155724']
+            elif row.name == 'MAE (MW)':
+                lgbm_val = lgbm_metrics['mae']
+                lstm_val = lstm_metrics['mae']
+                if lgbm_val < lstm_val:
+                    return ['', 'background-color: #d4edda; color: #155724', '']
+                else:
+                    return ['', '', 'background-color: #d4edda; color: #155724']
+            elif row.name == '最大单点误差 (%)':
+                lgbm_val = lgbm_metrics['max_ape']
+                lstm_val = lstm_metrics['max_ape']
+                if lgbm_val < lstm_val:
+                    return ['', 'background-color: #d4edda; color: #155724', '']
+                else:
+                    return ['', '', 'background-color: #d4edda; color: #155724']
+            return ['', '', '']
+        
+        metrics_table_styled = metrics_table.style.apply(highlight_recommended_row, axis=1)
+        st.table(metrics_table_styled)
+        
+        st.markdown("##### 6.3 分时段误差对比")
+        fig = plot_period_mape_comparison(
+            lgbm_period_mapes,
+            lstm_period_mapes,
+            title='各时段MAPE对比'
+        )
+        st_plot(fig, use_container_width=True)
+        
+        st.markdown("##### 6.4 分时段模型推荐")
+        
+        periods = ["谷时(0-7点)", "平时(7-11,15-19点)", "峰时(11-15,19-22点)", "深谷(22-24点)"]
+        recommendation_data = []
+        for period in periods:
+            recommendation_data.append({
+                '时段': period,
+                'LightGBM MAPE': f"{lgbm_period_mapes[period]:.2f}%",
+                'LSTM MAPE': f"{lstm_period_mapes[period]:.2f}%",
+                '推荐模型': recommendations[period]
+            })
+        
+        rec_table = pd.DataFrame(recommendation_data)
+        
+        def highlight_recommended_model(row):
+            styles = [''] * len(row)
+            if row['推荐模型'] == 'LightGBM':
+                styles[1] = 'background-color: #d4edda; color: #155724'
+            else:
+                styles[2] = 'background-color: #d4edda; color: #155724'
+            styles[3] = 'background-color: #d4edda; color: #155724; font-weight: bold'
+            return styles
+        
+        rec_table_styled = rec_table.style.apply(highlight_recommended_model, axis=1)
+        st.table(rec_table_styled)
+        
+        st.markdown("##### 6.5 推荐策略总结")
+        st.info(f"📊 {recommendation_summary}")
 
 
 def page_ultra_short_forecast():

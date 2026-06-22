@@ -188,3 +188,103 @@ def align_dataframes(df1: pd.DataFrame, df2: pd.DataFrame, key: str) -> Tuple[pd
     df1 = df1[df1[key].isin(common_keys)].sort_values(key).reset_index(drop=True)
     df2 = df2[df2[key].isin(common_keys)].sort_values(key).reset_index(drop=True)
     return df1, df2
+
+
+def max_absolute_percentage_error(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    mask = y_true != 0
+    if np.sum(mask) == 0:
+        return 0.0
+    return float(np.max(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100)
+
+
+def get_prediction_bias(y_true: np.ndarray, y_pred: np.ndarray) -> str:
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    errors = y_pred - y_true
+    mean_error = float(np.mean(errors))
+    if mean_error > 0:
+        return "偏高为主"
+    elif mean_error < 0:
+        return "偏低为主"
+    else:
+        return "无明显偏移"
+
+
+def get_time_period(hour: int) -> str:
+    if 0 <= hour < 7:
+        return "谷时(0-7点)"
+    elif 7 <= hour < 11 or 15 <= hour < 19:
+        return "平时(7-11,15-19点)"
+    elif 11 <= hour < 15 or 19 <= hour < 22:
+        return "峰时(11-15,19-22点)"
+    elif 22 <= hour < 24:
+        return "深谷(22-24点)"
+    else:
+        return "其他"
+
+
+def calculate_period_mape(result_df: pd.DataFrame, datetime_col: str = 'datetime', 
+                          actual_col: str = 'actual', pred_col: str = 'predicted') -> Dict[str, float]:
+    df = result_df.copy()
+    df[datetime_col] = pd.to_datetime(df[datetime_col])
+    df['hour'] = df[datetime_col].dt.hour
+    df['period'] = df['hour'].apply(get_time_period)
+    
+    period_mapes = {}
+    periods = ["谷时(0-7点)", "平时(7-11,15-19点)", "峰时(11-15,19-22点)", "深谷(22-24点)"]
+    
+    for period in periods:
+        period_data = df[df['period'] == period]
+        if len(period_data) > 0:
+            period_mapes[period] = mape(period_data[actual_col].values, period_data[pred_col].values)
+        else:
+            period_mapes[period] = 0.0
+    
+    return period_mapes
+
+
+def calculate_all_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
+    return {
+        'mape': mape(y_true, y_pred),
+        'rmse': rmse(y_true, y_pred),
+        'mae': mae(y_true, y_pred),
+        'max_ape': max_absolute_percentage_error(y_true, y_pred),
+        'bias': get_prediction_bias(y_true, y_pred)
+    }
+
+
+def recommend_models(lgbm_period_mapes: Dict[str, float], 
+                     lstm_period_mapes: Dict[str, float]) -> Tuple[Dict[str, str], str]:
+    recommendations = {}
+    periods = ["谷时(0-7点)", "平时(7-11,15-19点)", "峰时(11-15,19-22点)", "深谷(22-24点)"]
+    period_short = ["谷时", "平时", "峰时", "深谷"]
+    
+    for period, short in zip(periods, period_short):
+        if lgbm_period_mapes[period] < lstm_period_mapes[period]:
+            recommendations[period] = "LightGBM"
+        else:
+            recommendations[period] = "LSTM"
+    
+    lgbm_better = [p for p, m in recommendations.items() if m == "LightGBM"]
+    lstm_better = [p for p, m in recommendations.items() if m == "LSTM"]
+    
+    if len(lstm_better) == 0:
+        summary = "各时段均建议使用LightGBM模型"
+    elif len(lgbm_better) == 0:
+        summary = "各时段均建议使用LSTM模型"
+    else:
+        lgbm_short = [period_short[periods.index(p)] for p in lgbm_better]
+        lstm_short = [period_short[periods.index(p)] for p in lstm_better]
+        
+        if len(lstm_better) == 1:
+            summary = f"{lstm_short[0]}建议用LSTM，其余时段LightGBM表现更优"
+        elif len(lgbm_better) == 1:
+            summary = f"{lgbm_short[0]}建议用LightGBM，其余时段LSTM表现更优"
+        else:
+            lstm_str = "、".join(lstm_short)
+            lgbm_str = "、".join(lgbm_better)
+            summary = f"{lstm_str}建议用LSTM，{lgbm_str}建议用LightGBM"
+    
+    return recommendations, summary
