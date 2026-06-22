@@ -30,6 +30,7 @@ from src.demand_response import (
     create_default_resources, analyze_dr_potential
 )
 from src.error_analysis import ErrorAnalyzer
+from src.anomaly_detection import AnomalyDetector
 from src.visualization import (
     plot_time_series, plot_prediction_comparison, plot_feature_importance,
     plot_error_distribution, plot_error_vs_temperature, plot_peak_valley,
@@ -129,6 +130,8 @@ if 'short_term_model' not in st.session_state:
     st.session_state.short_term_model = None
 if 'model_comparison_result' not in st.session_state:
     st.session_state.model_comparison_result = None
+if 'anomaly_detection_result' not in st.session_state:
+    st.session_state.anomaly_detection_result = None
 
 def page_data_import():
     st.header("📊 数据导入与质量检查")
@@ -2104,6 +2107,279 @@ def page_error_analysis():
                 st_plot(fig, use_container_width=True)
 
 
+def page_anomaly_detection():
+    st.header("🔍 负荷异常检测与事件关联")
+
+    if st.session_state.load_data is None:
+        st.warning("⚠️ 请先在'数据导入'页面完成数据导入")
+        return
+
+    st.markdown("---")
+
+    load_df = st.session_state.load_data.copy()
+    calendar_df = st.session_state.calendar_data
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        baseline_days = st.slider("基线历史天数", 7, 30, 14, 1)
+    with col2:
+        mad_threshold = st.slider("MAD阈值倍数", 2.0, 5.0, 3.0, 0.5)
+    with col3:
+        max_gap = st.slider("事件聚合最大间隔(分钟)", 15, 90, 45, 15)
+    with col4:
+        corr_window = st.slider("关联搜索窗口(小时)", 1, 6, 2, 1)
+
+    st.markdown("---")
+
+    if st.button("🔍 执行异常检测与关联分析", type="primary") or st.session_state.anomaly_detection_result is not None:
+        need_recompute = st.button("🔄 重新执行分析", key='recompute_anomaly')
+
+        if need_recompute or st.session_state.anomaly_detection_result is None:
+            with st.spinner("正在执行异常检测与事件关联分析..."):
+                try:
+                    detector = AnomalyDetector(
+                        target_col='active_power_MW',
+                        datetime_col='datetime',
+                        temp_col='temperature_C',
+                        solar_col='solar_irradiance_Wm2',
+                        baseline_days=baseline_days,
+                        mad_threshold=mad_threshold,
+                        max_gap_minutes=max_gap,
+                        correlation_window_hours=corr_window
+                    )
+                    result = detector.run_full_analysis(load_df, calendar_df)
+                    st.session_state.anomaly_detection_result = result
+                    st.success("✅ 异常检测与关联分析完成！")
+                except Exception as e:
+                    st.error(f"分析失败：{str(e)}")
+                    import traceback
+                    st.error(traceback.format_exc())
+                    return
+
+        result = st.session_state.anomaly_detection_result
+        if result is None:
+            return
+
+        anomaly_events = result['anomaly_events']
+        correlation_stats = result['correlation_stats']
+        monthly_stats = result['monthly_stats']
+        anomaly_points_df = result['anomaly_points']
+
+        st.subheader("1. 异常事件概览")
+
+        total_events = len(anomaly_events)
+        if total_events > 0:
+            pos_count = len(anomaly_events[anomaly_events['deviation_direction'].str.contains('正')])
+            neg_count = total_events - pos_count
+            avg_duration = anomaly_events['duration_minutes'].mean()
+            avg_deviation = anomaly_events['peak_deviation_ratio'].abs().mean()
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("异常事件总数", total_events)
+            with col2:
+                st.metric("正异常(突增)", pos_count)
+            with col3:
+                st.metric("负异常(骤降)", neg_count)
+            with col4:
+                st.metric("平均持续时长", f"{avg_duration:.0f} 分钟")
+        else:
+            st.info("未检测到异常事件")
+
+        st.markdown("---")
+        st.subheader("2. 异常事件时间轴")
+
+        if total_events > 0:
+            color_map = {
+                '气象关联': '#dc3545',
+                '日历关联': '#ED8936',
+                '复合关联(气象+日历)': '#805AD5',
+                '未知原因': '#718096'
+            }
+
+            scatter_df = anomaly_events.copy()
+            scatter_df['color'] = scatter_df['correlation_type'].map(color_map)
+            scatter_df['abs_deviation'] = scatter_df['peak_deviation_ratio'].abs()
+
+            fig = go.Figure()
+
+            for corr_type, color in color_map.items():
+                sub = scatter_df[scatter_df['correlation_type'] == corr_type]
+                if len(sub) > 0:
+                    fig.add_trace(go.Scatter(
+                        x=sub['start_time'],
+                        y=sub['peak_deviation_ratio'],
+                        mode='markers',
+                        name=corr_type,
+                        marker=dict(
+                            size=10,
+                            color=color,
+                            opacity=0.8,
+                            line=dict(width=1, color='white')
+                        ),
+                        hovertemplate=(
+                            '开始时间: %{x}<br>'
+                            '偏离倍数: %{y:.2f}<br>'
+                            '持续时长: %{customdata[0]}分钟<br>'
+                            '关联类型: ' + corr_type + '<br>'
+                            '<extra></extra>'
+                        ),
+                        customdata=sub[['duration_minutes']].values
+                    ))
+
+            fig.add_hline(
+                y=mad_threshold,
+                line_dash='dash',
+                line_color='red',
+                opacity=0.5,
+                annotation_text=f'+{mad_threshold}σ (阈值)'
+            )
+            fig.add_hline(
+                y=-mad_threshold,
+                line_dash='dash',
+                line_color='red',
+                opacity=0.5,
+                annotation_text=f'-{mad_threshold}σ (阈值)'
+            )
+
+            fig.update_layout(
+                title='异常事件时间轴（偏离倍数）',
+                xaxis_title='时间',
+                yaxis_title='偏离倍数 (σ)',
+                hovermode='x unified',
+                legend=dict(
+                    orientation='h',
+                    yanchor='bottom',
+                    y=1.02,
+                    xanchor='right',
+                    x=1
+                ),
+                template='plotly_white',
+                height=450
+            )
+            st_plot(fig, use_container_width=True)
+        else:
+            st.info("暂无异常事件可展示")
+
+        st.markdown("---")
+        st.subheader("3. 事件详情与关联分析")
+
+        if total_events > 0:
+            col_left, col_right = st.columns([3, 2])
+
+            with col_left:
+                st.markdown("##### 异常事件列表")
+
+                display_df = anomaly_events[[
+                    'event_id', 'start_time', 'end_time', 'duration_minutes',
+                    'peak_deviation_ratio', 'deviation_direction',
+                    'correlation_type', 'weather_event_types', 'calendar_info'
+                ]].copy()
+
+                display_df = display_df.rename(columns={
+                    'event_id': '事件ID',
+                    'start_time': '开始时间',
+                    'end_time': '结束时间',
+                    'duration_minutes': '持续时长(分钟)',
+                    'peak_deviation_ratio': '峰值偏离倍数',
+                    'deviation_direction': '偏离方向',
+                    'correlation_type': '关联类型',
+                    'weather_event_types': '关联气象',
+                    'calendar_info': '关联日历'
+                })
+
+                sort_options = ['开始时间', '峰值偏离倍数', '持续时长(分钟)']
+                sort_by = st.selectbox(
+                    "按列排序",
+                    sort_options,
+                    index=0,
+                    key='event_sort'
+                )
+                sort_asc = st.checkbox("升序", value=False, key='event_sort_asc')
+
+                if sort_by == '开始时间':
+                    display_df = display_df.sort_values('开始时间', ascending=sort_asc)
+                elif sort_by == '峰值偏离倍数':
+                    display_df = display_df.sort_values('峰值偏离倍数', ascending=sort_asc)
+                else:
+                    display_df = display_df.sort_values('持续时长(分钟)', ascending=sort_asc)
+
+                st.dataframe(
+                    display_df.style.format({
+                        '峰值偏离倍数': '{:.2f}'
+                    }),
+                    use_container_width=True,
+                    height=450
+                )
+
+            with col_right:
+                st.markdown("##### 关联类型分布")
+
+                if correlation_stats is not None and len(correlation_stats) > 0:
+                    pie_colors = [color_map.get(t, '#718096') for t in correlation_stats['关联类型']]
+
+                    fig = go.Figure(data=[go.Pie(
+                        labels=correlation_stats['关联类型'],
+                        values=correlation_stats['事件数量'],
+                        hole=0.45,
+                        marker=dict(colors=pie_colors),
+                        textinfo='label+percent',
+                        textfont=dict(size=11),
+                        hovertemplate=(
+                            '%{label}<br>'
+                            '事件数: %{value}<br>'
+                            '占比: %{percent}<extra></extra>'
+                        )
+                    )])
+                    fig.update_layout(
+                        title='异常事件关联类型占比',
+                        template='plotly_white',
+                        height=280,
+                        showlegend=False
+                    )
+                    st_plot(fig, use_container_width=True)
+                else:
+                    st.info("暂无关联统计数据")
+
+                st.markdown("##### 月度异常频次")
+
+                if monthly_stats is not None and len(monthly_stats) > 0:
+                    fig = go.Figure(data=[go.Bar(
+                        x=monthly_stats['month'],
+                        y=monthly_stats['异常事件数'],
+                        marker_color='#1E3A5F',
+                        text=monthly_stats['异常事件数'],
+                        textposition='outside',
+                        hovertemplate='月份: %{x}<br>异常事件数: %{y}<extra></extra>'
+                    )])
+                    fig.update_layout(
+                        title='各月异常事件数量',
+                        xaxis_title='月份',
+                        yaxis_title='异常事件数',
+                        template='plotly_white',
+                        height=280
+                    )
+                    st_plot(fig, use_container_width=True)
+                else:
+                    st.info("暂无月度统计数据")
+
+            if correlation_stats is not None and len(correlation_stats) > 0:
+                st.markdown("---")
+                st.subheader("4. 关联分析统计")
+
+                col1, col2, col3, col4 = st.columns(4)
+                for i, (_, row) in enumerate(correlation_stats.iterrows()):
+                    if i < 4:
+                        with [col1, col2, col3, col4][i]:
+                            st.metric(
+                                row['关联类型'],
+                                f"{int(row['事件数量'])} 件",
+                                f"{row['占比']*100:.1f}%"
+                            )
+        else:
+            st.info("未检测到异常事件，建议调整检测参数后重试")
+
+
 def main():
     st.sidebar.title("⚡ 区域电网负荷预测与需求响应优化分析系统")
     
@@ -2112,7 +2388,7 @@ def main():
     page = st.sidebar.radio(
         "选择功能模块",
         ["📊 数据导入", "📈 短期预测", "⚡ 超短期预测", 
-         "📊 峰谷分析", "🔧 需求响应", "📉 误差分析"],
+         "📊 峰谷分析", "🔧 需求响应", "📉 误差分析", "🔍 异常检测"],
         index=0
     )
     
@@ -2125,6 +2401,7 @@ def main():
     3. 在「峰谷分析」页面分析负荷特性
     4. 在「需求响应」页面模拟优化调度
     5. 在「误差分析」页面评估预测精度
+    6. 在「异常检测」页面分析负荷异常与关联因素
     """)
     
     if page == "📊 数据导入":
@@ -2139,6 +2416,8 @@ def main():
         page_demand_response()
     elif page == "📉 误差分析":
         page_error_analysis()
+    elif page == "🔍 异常检测":
+        page_anomaly_detection()
     
     st.sidebar.markdown("---")
     st.sidebar.markdown("**版本**: v1.0.0")
